@@ -64,7 +64,7 @@ def collect(compare, before, after):
     included=[]; anchors={}; skipped=0
     for f in files:
         path=f.get('filename','')
-        if not SAFE_PATH.fullmatch(path) or '..' in PurePosixPath(path).parts or any(x in path.lower().split('/') for x in ['vendor','dist','generated','fixtures','node_modules','secrets']):
+        if not SAFE_PATH.fullmatch(path) or '..' in PurePosixPath(path).parts or any(x in path.lower().split('/') for x in ['vendor','dist','generated','fixtures','node_modules','secrets','.github']):
             skipped+=1; continue
         require(f.get('status') in ['added','modified'], 'rename/delete requires manual review')
         patch=f.get('patch','')
@@ -165,7 +165,7 @@ def verify_budget_reservation():
     identity=os.environ['GITHUB_RUN_ID']+':'+os.environ['GITHUB_RUN_ATTEMPT']
     require(ledger.get('version')==1 and identity in ledger.get('months',{}).get(month,[]), 'no reservation for this run attempt')
 
-def model_review(files):
+def model_review(files, budget_check=None):
     require(os.environ.get('AI_REVIEW_ENABLED')=='true','paid review disabled')
     model=os.environ.get('AI_MODEL','')
     require(model=='gpt-5.4-mini-2026-03-17','audited model snapshot required')
@@ -184,7 +184,7 @@ def model_review(files):
     require(re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}',expiry)
             and datetime.now(timezone.utc).strftime('%Y-%m-%d')<=expiry,'pricing approval expired')
     require((capacity*ir+2000*out)*Decimal('1.25')/1000000 <= cap,'worst-case run cap exceeded')
-    verify_budget_reservation()
+    (budget_check or verify_budget_reservation)()
     response=request_json('https://api.openai.com/v1/responses',os.environ['OPENAI_API_KEY'],{
       'model':model,'service_tier':'default','store':False,'max_output_tokens':2000,'instructions':prompt,
       'input':content,'text':{'format':{'type':'json_schema','name':'review','strict':True,'schema':SCHEMA}}})
@@ -193,11 +193,14 @@ def model_review(files):
     require(len(pieces)==1 and len(pieces[0].encode())<=MAX_OUTPUT,'invalid response')
     return json.loads(pieces[0])
 
-def main(mode):
+def main(mode, budget_check=None, event_override=None):
     if mode=='reserve':
         reserve_monthly_budget()
         return
-    with open(os.environ['GITHUB_EVENT_PATH']) as event_file: event=json.load(event_file)
+    if event_override is None:
+        with open(os.environ['GITHUB_EVENT_PATH']) as event_file: event=json.load(event_file)
+    else:
+        event=event_override
     repo=os.environ['GITHUB_REPOSITORY']; require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repo),'invalid repository')
     before,after=event_identity(event,repo)
     token=os.environ['GH_TOKEN']; root='https://api.github.com/repos/'+repo
@@ -205,7 +208,7 @@ def main(mode):
     files,anchors,skipped=collect(compare,before,after)
     require(files,'no eligible source files')
     if mode=='review':
-        findings=validate(model_review(files),anchors)
+        findings=validate(model_review(files,budget_check),anchors)
         encoded=base64.b64encode(json.dumps({'findings':findings}).encode()).decode()
         require(len(encoded)<=MAX_OUTPUT,'output limit')
         with open(os.environ['GITHUB_OUTPUT'],'a') as output: output.write('findings='+encoded+'\n')
