@@ -1,50 +1,58 @@
-# Installed with audited code pin. Review/publishing remain gated by explicit enable variables.
+# Master-only durable queue. Existing enable variables still gate paid review/publication.
 name: AI push review pilot
 on:
   push:
     branches: [master]
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
 permissions: {}
 concurrency:
   group: ai-push-review-pilot
   cancel-in-progress: false
-  queue: max # Up to 100 pending; additional runs are canceled, not guaranteed delivery.
+  queue: max
 env:
-  TRUSTED_REVIEW_SHA: 3c5a4451e01d9306a93a99b56253e19bfd3100fd
+  TRUSTED_REVIEW_SHA: e8dc60ba63c5eff3729a7ddebe83b50b1a7da0ed
   AI_REVIEW_ENABLED: ${{ vars.AI_REVIEW_ENABLED }}
   AI_PUBLISH_ENABLED: ${{ vars.AI_PUBLISH_ENABLED }}
+  PRICING_VALID_UNTIL: ${{ vars.PRICING_VALID_UNTIL }}
 jobs:
-  reserve:
-    if: github.event.deleted == false && github.event.created == false && github.event.forced == false && vars.AI_REVIEW_ENABLED == 'true'
+  coordinate:
+    if: github.ref == 'refs/heads/master' && github.event.deleted != true && github.event.created != true && github.event.forced != true
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: ai-review-budget
     permissions:
-      contents: write # Budget ledger CAS; protected trusted runner only
+      contents: write
+    outputs:
+      event_key: ${{ steps.coordinate.outputs.event_key }}
     steps:
-      - name: Load only audited reviewer; never checkout pushed source
+      - name: Load immutable audited queue and reviewer; never checkout pushed source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
+          python3 - <<'PYBOOT'
           import base64, os, re, urllib.request, json
           sha=os.environ['TRUSTED_REVIEW_SHA']
-          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited reviewer before enabling'
-          url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/review.py?ref='+sha
-          req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited code before enabling'
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
                   raise RuntimeError('API redirect refused')
-          with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
-          assert doc['type']=='file' and doc['size']<50000
-          open(os.environ['RUNNER_TEMP']+'/trusted-review.py','wb').write(base64.b64decode(doc['content']))
-          PY
-      - name: Reserve USD1 atomically before any paid request
+          for name in ['review.py','queue_worker.py']:
+              url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/'+name+'?ref='+sha
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
+              assert doc['type']=='file' and doc['size']<50000
+              open(os.environ['RUNNER_TEMP']+'/'+name,'wb').write(base64.b64decode(doc['content']))
+          PYBOOT
+      - name: Preserve pushes and atomically claim at most one eligible review
+        id: coordinate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 "$RUNNER_TEMP/trusted-review.py" reserve
+        run: python3 "$RUNNER_TEMP/queue_worker.py" coordinate
   review:
-    needs: reserve
-    if: github.event.deleted == false && github.event.created == false && github.event.forced == false && vars.AI_REVIEW_ENABLED == 'true'
+    needs: coordinate
+    if: needs.coordinate.outputs.event_key != '' && vars.AI_REVIEW_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: ai-review
@@ -52,39 +60,41 @@ jobs:
       contents: read
     outputs:
       findings: ${{ steps.review.outputs.findings }}
+      review_outcome: ${{ steps.review.outputs.review_outcome }}
     steps:
-      - name: Load only audited reviewer; never checkout pushed source
+      - name: Load immutable audited queue and reviewer; never checkout pushed source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
+          python3 - <<'PYBOOT'
           import base64, os, re, urllib.request, json
           sha=os.environ['TRUSTED_REVIEW_SHA']
-          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited reviewer before enabling'
-          url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/review.py?ref='+sha
-          req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited code before enabling'
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
                   raise RuntimeError('API redirect refused')
-          with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
-          assert doc['type']=='file' and doc['size']<50000
-          open(os.environ['RUNNER_TEMP']+'/trusted-review.py','wb').write(base64.b64decode(doc['content']))
-          PY
-      - name: Read-only bounded review
+          for name in ['review.py','queue_worker.py']:
+              url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/'+name+'?ref='+sha
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
+              assert doc['type']=='file' and doc['size']<50000
+              open(os.environ['RUNNER_TEMP']+'/'+name,'wb').write(base64.b64decode(doc['content']))
+          PYBOOT
+      - name: Review immutable queued diff with one bounded paid request
         id: review
         env:
           GH_TOKEN: ${{ github.token }}
+          QUEUE_EVENT_KEY: ${{ needs.coordinate.outputs.event_key }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: ${{ vars.AI_MODEL }}
           INPUT_USD_PER_MILLION: ${{ vars.INPUT_USD_PER_MILLION }}
           OUTPUT_USD_PER_MILLION: ${{ vars.OUTPUT_USD_PER_MILLION }}
           MODEL_MAX_INPUT_TOKENS: ${{ vars.MODEL_MAX_INPUT_TOKENS }}
-          PRICING_VALID_UNTIL: ${{ vars.PRICING_VALID_UNTIL }}
           MAX_USD_PER_RUN: ${{ vars.MAX_USD_PER_RUN }}
-        run: python3 "$RUNNER_TEMP/trusted-review.py" review
+        run: python3 "$RUNNER_TEMP/queue_worker.py" review
   publish:
-    needs: review
-    if: vars.AI_PUBLISH_ENABLED == 'true' && needs.review.outputs.findings != ''
+    needs: [coordinate, review]
+    if: vars.AI_PUBLISH_ENABLED == 'true' && needs.review.outputs.review_outcome == 'completed' && needs.review.outputs.findings != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: ai-review-publish
@@ -92,25 +102,62 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: Load audited publisher in fresh VM without model key
+      - name: Load immutable audited queue and reviewer; never checkout pushed source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
+          python3 - <<'PYBOOT'
           import base64, os, re, urllib.request, json
           sha=os.environ['TRUSTED_REVIEW_SHA']
-          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited reviewer before enabling'
-          url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/review.py?ref='+sha
-          req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited code before enabling'
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
                   raise RuntimeError('API redirect refused')
-          with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
-          assert doc['type']=='file' and doc['size']<50000
-          open(os.environ['RUNNER_TEMP']+'/trusted-review.py','wb').write(base64.b64decode(doc['content']))
-          PY
-      - name: Revalidate against GitHub and publish at most three issues
+          for name in ['review.py','queue_worker.py']:
+              url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/'+name+'?ref='+sha
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
+              assert doc['type']=='file' and doc['size']<50000
+              open(os.environ['RUNNER_TEMP']+'/'+name,'wb').write(base64.b64decode(doc['content']))
+          PYBOOT
+      - name: Revalidate queued diff and publish validated findings only
         env:
           GH_TOKEN: ${{ github.token }}
+          QUEUE_EVENT_KEY: ${{ needs.coordinate.outputs.event_key }}
           REVIEW_FINDINGS: ${{ needs.review.outputs.findings }}
-        run: python3 "$RUNNER_TEMP/trusted-review.py" publish
+        run: python3 "$RUNNER_TEMP/queue_worker.py" publish
+  finalize:
+    needs: [coordinate, review, publish]
+    if: always() && needs.coordinate.outputs.event_key != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ai-review-budget
+    permissions:
+      contents: write
+    steps:
+      - name: Load immutable audited queue and reviewer; never checkout pushed source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYBOOT'
+          import base64, os, re, urllib.request, json
+          sha=os.environ['TRUSTED_REVIEW_SHA']
+          assert re.fullmatch('[0-9a-f]{40}',sha), 'Pin audited code before enabling'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise RuntimeError('API redirect refused')
+          for name in ['review.py','queue_worker.py']:
+              url='https://api.github.com/repos/'+os.environ['GITHUB_REPOSITORY']+'/contents/.github/ai-review/'+name+'?ref='+sha
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.build_opener(NoRedirect()).open(req,timeout=30) as r: doc=json.load(r)
+              assert doc['type']=='file' and doc['size']<50000
+              open(os.environ['RUNNER_TEMP']+'/'+name,'wb').write(base64.b64decode(doc['content']))
+          PYBOOT
+      - name: Record outcome without refund or ambiguous paid retry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_EVENT_KEY: ${{ needs.coordinate.outputs.event_key }}
+          REVIEW_OUTCOME: ${{ needs.review.outputs.review_outcome }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+        run: python3 "$RUNNER_TEMP/queue_worker.py" finalize
